@@ -24,7 +24,8 @@ A clean, modern MVP for event creation with trust-first automation. The system o
 - React 18
 - Vite
 - Tailwind CSS
-- Tesseract.js (OCR for images)
+- **OCR.space API** (Free OCR for images - much better than Tesseract)
+- **OpenAI GPT-4 Vision** (Optional - for best accuracy)
 - pdf.js (PDF text extraction)
 - react-dropzone (file upload)
 
@@ -35,15 +36,45 @@ A clean, modern MVP for event creation with trust-first automation. The system o
 npm install
 ```
 
-2. Start development server:
+2. (Optional) Set up API keys for better accuracy:
+   - Create a `.env` file in the project root (see `env.example.txt`)
+   - The free OCR.space API key is already included
+   - For best results, add your OpenAI API key to `.env`:
+   ```bash
+   echo "VITE_OPENAI_API_KEY=your_key_here" > .env
+   ```
+   Get an OpenAI API key from: https://platform.openai.com/api-keys
+
+3. Start development server:
 ```bash
 npm run dev
 ```
 
-3. Build for production:
+4. Build for production:
 ```bash
 npm run build
 ```
+
+## OCR Options
+
+The system tries multiple OCR methods in order of accuracy:
+
+1. **OpenAI GPT-4 Vision** (if API key provided)
+   - Most accurate
+   - Understands context (knows "Satrangi Re" is event name, not "menu")
+   - Returns structured JSON directly
+   - Costs ~$0.01-0.02 per image
+   - Set `VITE_OPENAI_API_KEY` to enable
+
+2. **OCR.space API** (default, free tier)
+   - Better than Tesseract for posters
+   - Free tier: 25,000 requests/month
+   - No API key needed (uses shared key)
+   - Get your own key for higher limits: https://ocr.space/ocrapi
+
+3. **Pattern matching fallback**
+   - Parses OCR text using flexible regex patterns
+   - No hardcoded values (cities, venues, etc.)
 
 ## How It Works
 

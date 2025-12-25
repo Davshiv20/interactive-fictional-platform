@@ -3,42 +3,137 @@ import * as pdfjsLib from 'pdfjs-dist';
 // Configure PDF.js worker - using unpkg CDN for reliability
 pdfjsLib.GlobalWorkerOptions.workerSrc = `https://unpkg.com/pdfjs-dist@${pdfjsLib.version}/build/pdf.worker.min.js`;
 
-// Dynamic import for Tesseract.js to handle CommonJS/ESM interop
-let TesseractModule = null;
+// API Keys (set in environment variables or leave empty for free tier)
+const OCR_SPACE_API_KEY = import.meta.env.VITE_OCR_SPACE_API_KEY || 'K87899142388957'; // Free API key
+const OPENAI_API_KEY = import.meta.env.VITE_OPENAI_API_KEY || '';
 
-async function getTesseract() {
-  if (!TesseractModule) {
-    TesseractModule = await import('tesseract.js');
+/**
+ * Extract text from image using OCR.space API (more accurate than Tesseract)
+ */
+async function extractTextFromImageOCRSpace(file) {
+  try {
+    const formData = new FormData();
+    formData.append('file', file);
+    formData.append('language', 'eng');
+    formData.append('isOverlayRequired', 'false');
+    formData.append('detectOrientation', 'true');
+    formData.append('scale', 'true');
+    formData.append('OCREngine', '2'); // Use OCR Engine 2 (better for complex layouts)
+
+    const response = await fetch('https://api.ocr.space/parse/image', {
+      method: 'POST',
+      headers: {
+        'apikey': OCR_SPACE_API_KEY,
+      },
+      body: formData,
+    });
+
+    const result = await response.json();
+
+    if (result.ParsedResults && result.ParsedResults.length > 0) {
+      const text = result.ParsedResults[0].ParsedText;
+      console.log('Extracted OCR text (OCR.space):', text.substring(0, 500));
+      return text;
+    }
+
+    return '';
+  } catch (error) {
+    console.error('OCR.space Error:', error);
+    return '';
   }
-  // Handle both default export (CommonJS interop) and named exports
-  return TesseractModule.default || TesseractModule;
 }
 
 /**
- * Extract text from image using Tesseract OCR
+ * Extract event details using OpenAI Vision API (most accurate, understands context)
+ * Requires VITE_OPENAI_API_KEY environment variable
+ */
+async function extractEventDetailsWithOpenAI(file) {
+  if (!OPENAI_API_KEY) {
+    return null; // Skip if no API key
+  }
+
+  try {
+    // Convert file to base64
+    const base64 = await new Promise((resolve) => {
+      const reader = new FileReader();
+      reader.onloadend = () => resolve(reader.result);
+      reader.readAsDataURL(file);
+    });
+
+    const response = await fetch('https://api.openai.com/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${OPENAI_API_KEY}`,
+      },
+      body: JSON.stringify({
+        model: 'gpt-4o-mini',
+        messages: [
+          {
+            role: 'user',
+            content: [
+              {
+                type: 'text',
+                text: `Extract event details from this poster/flyer. Return ONLY a JSON object with these fields: eventName, date, time, venue, city, description, whatToExpect. 
+                
+Rules:
+- Only include fields you are CONFIDENT about
+- Leave out fields if you're uncertain
+- For eventName: extract the main event title (not taglines or artist names)
+- For date: extract the exact date (e.g., "21st December 2025")
+- For venue: extract the venue name
+- For city: extract the city name
+- Return valid JSON only, no explanation`,
+              },
+              {
+                type: 'image_url',
+                image_url: {
+                  url: base64,
+                },
+              },
+            ],
+          },
+        ],
+        max_tokens: 500,
+      }),
+    });
+
+    const result = await response.json();
+    
+    if (result.choices && result.choices[0]?.message?.content) {
+      const content = result.choices[0].message.content;
+      // Extract JSON from response (might have markdown formatting)
+      const jsonMatch = content.match(/\{[\s\S]*\}/);
+      if (jsonMatch) {
+        const eventDetails = JSON.parse(jsonMatch[0]);
+        console.log('Extracted details (OpenAI):', eventDetails);
+        return eventDetails;
+      }
+    }
+
+    return null;
+  } catch (error) {
+    console.error('OpenAI Vision Error:', error);
+    return null;
+  }
+}
+
+/**
+ * Extract text from image - uses best available method
  */
 async function extractTextFromImage(file) {
-  try {
-    const Tesseract = await getTesseract();
-    
-    // Create image URL from file
-    const imageUrl = URL.createObjectURL(file);
-    
-    // Use Tesseract.recognize directly
-    const { data: { text } } = await Tesseract.recognize(imageUrl, 'eng', {
-      logger: (m) => {
-        // Progress logging can be added here if needed
-      }
-    });
-    
-    // Clean up the object URL
-    URL.revokeObjectURL(imageUrl);
-    
-    return text;
-  } catch (error) {
-    console.error('OCR Error:', error);
-    return '';
+  // Try OpenAI Vision first (most accurate, if API key available)
+  if (OPENAI_API_KEY) {
+    const aiResult = await extractEventDetailsWithOpenAI(file);
+    if (aiResult) {
+      // Convert to text format for parseEventDetails
+      return JSON.stringify(aiResult);
+    }
   }
+
+  // Fallback to OCR.space
+  const text = await extractTextFromImageOCRSpace(file);
+  return text;
 }
 
 /**
@@ -101,32 +196,73 @@ function parseEventDetails(text) {
   }
 
   const normalizedText = text.toLowerCase();
+  const lines = text.split('\n').map(line => line.trim()).filter(line => line.length > 0);
 
-  // Extract event name - look for title patterns (first line, or after keywords)
-  const titlePatterns = [
-    /^(?:event|title|name)[\s:]*([^\n]{3,60})/i,
-    /^([A-Z][^\n]{5,60})/m,
-  ];
+  // Extract event name - improved patterns
+  // Look for text before "BY [ARTIST]" pattern (common in event posters)
+  const byArtistPattern = /\bby\s+([^\n]{3,40})/i;
+  const byMatch = text.match(byArtistPattern);
   
-  for (const pattern of titlePatterns) {
-    const match = text.match(pattern);
-    if (match && match[1] && match[1].trim().length > 3) {
-      details.eventName = match[1].trim();
-      break;
+  if (byMatch) {
+    // Find text before "BY [ARTIST]" - likely the event name
+    const beforeBy = text.substring(0, byMatch.index).trim();
+    const beforeByLines = beforeBy.split('\n').map(l => l.trim()).filter(l => l.length > 0);
+    
+    // Look for the largest/most prominent line before "BY"
+    let bestCandidate = '';
+    for (const line of beforeByLines.reverse()) {
+      // Skip very short lines and navigation elements
+      if (line.length >= 5 && line.length <= 50 && 
+          !line.match(/^[=\-_]+/) && // Skip separator lines
+          !line.match(/menu|nav|header/i)) {
+        bestCandidate = line;
+        break;
+      }
+    }
+    
+    if (bestCandidate) {
+      details.eventName = bestCandidate.trim();
+    }
+  }
+  
+  // If not found, look for prominent title patterns
+  if (!details.eventName) {
+    // Look for lines that look like titles (avoid navigation and UI elements)
+    for (const line of lines) {
+      if (line.length >= 5 && line.length <= 50) {
+        // Skip UI elements, navigation, and dates
+        if (line.match(/^[=\-_]+/) || // Separator lines
+            line.match(/menu|nav|header|footer/i) || // Navigation
+            line.match(/^\d{1,2}(st|nd|rd|th)?\s+(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)/i) || // Dates
+            line.match(/^(january|february|march|april|may|june|july|august|september|october|november|december)/i)) {
+          continue;
+        }
+        
+        // Check if it has reasonable word count
+        const wordCount = line.split(/\s+/).length;
+        if (wordCount >= 1 && wordCount <= 6) {
+          details.eventName = line.trim();
+          break;
+        }
+      }
     }
   }
 
-  // Extract date - look for common date patterns
+  // Extract date - improved patterns including ordinal numbers (21ST, 22ND, etc.)
   const datePatterns = [
+    // Ordinal dates: "21ST DECEMBER 2025", "21ST DEC 2025"
+    /\b(\d{1,2}(?:st|nd|rd|th)?\s+(?:january|february|march|april|may|june|july|august|september|october|november|december|jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\s+\d{4})\b/i,
+    // Standard formats: "DECEMBER 21, 2025", "21 DECEMBER 2025"
+    /\b((?:january|february|march|april|may|june|july|august|september|october|november|december|jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\s+\d{1,2},?\s+\d{4})\b/i,
+    /\b(\d{1,2}\s+(?:january|february|march|april|may|june|july|august|september|october|november|december|jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec),?\s+\d{4})\b/i,
+    // Numeric formats: "12/21/2025", "21-12-2025"
     /\b(\d{1,2}[\/\-\.]\d{1,2}[\/\-\.]\d{2,4})\b/,
-    /\b(january|february|march|april|may|june|july|august|september|october|november|december)\s+\d{1,2},?\s+\d{4}\b/i,
-    /\b\d{1,2}\s+(january|february|march|april|may|june|july|august|september|october|november|december),?\s+\d{4}\b/i,
   ];
 
   for (const pattern of datePatterns) {
     const match = text.match(pattern);
-    if (match && match[0]) {
-      details.date = match[0].trim();
+    if (match && match[1]) {
+      details.date = match[1].trim();
       break;
     }
   }
@@ -145,31 +281,47 @@ function parseEventDetails(text) {
     }
   }
 
-  // Extract venue - look for venue keywords
+  // Extract venue - improved patterns
   const venuePatterns = [
-    /(?:venue|location|place|at)[\s:]+([^\n]{3,50})/i,
-    /\b(?:the|at)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)\s+(?:theater|hall|center|centre|venue|club|bar|restaurant|park|stadium|arena)\b/i,
+    // Look for "GIFT CITY", "CONVENTION CENTER", etc. (all caps venue names)
+    /\b([A-Z]{2,}(?:\s+[A-Z]{2,})*\s+(?:CITY|CENTER|CENTRE|HALL|THEATER|THEATRE|STADIUM|ARENA|AUDITORIUM|GROUND|PARK|CLUB|BAR|RESTAURANT))\b/,
+    // Look for venue keywords followed by name
+    /(?:venue|location|place|at|in)[\s:]+([A-Z][A-Za-z\s]{2,30}?)(?:\s|$|,)/i,
+    // Look for common venue patterns
+    /\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*\s+(?:theater|theatre|hall|center|centre|venue|club|bar|restaurant|park|stadium|arena|auditorium|ground))\b/i,
   ];
 
   for (const pattern of venuePatterns) {
     const match = text.match(pattern);
     if (match && match[1]) {
-      details.venue = match[1].trim();
-      break;
+      const venue = match[1].trim();
+      // Filter out common false positives
+      if (!venue.match(/^(BY|THE|AND|OR|IN|AT|ON)$/i) && venue.length > 2) {
+        details.venue = venue;
+        break;
+      }
     }
   }
 
-  // Extract city - look for city patterns
+  // Extract city - flexible pattern (no hardcoding)
   const cityPatterns = [
-    /(?:city|in)[\s:]+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)/,
-    /\b([A-Z][a-z]+),?\s+(?:CA|NY|TX|FL|IL|PA|OH|GA|NC|MI|NJ|VA|WA|AZ|MA|TN|IN|MO|MD|WI|CO|MN|SC|AL|LA|KY|OR|OK|CT|IA|AR|UT|NV|MS|KS|NM|NE|WV|ID|HI|NH|ME|RI|MT|DE|SD|ND|AK|DC|VT|WY)\b/,
+    // Look for prominent all-caps words at the top (likely city name)
+    /^([A-Z]{3,}(?:\s+[A-Z]{3,})?)\s*$/m,
+    // Look for "City:" or similar keywords
+    /(?:city|location|in|at)[\s:]+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)/i,
   ];
 
   for (const pattern of cityPatterns) {
     const match = text.match(pattern);
     if (match && match[1]) {
-      details.city = match[1].trim();
-      break;
+      const city = match[1].trim();
+      // Filter out common false positives
+      if (!city.match(/^(BY|THE|AND|OR|IN|AT|ON|YOUR|PLAYLIST|COMING|ALIVE|MENU)$/i) && 
+          city.length > 2 && 
+          city.length < 30) {
+        details.city = city;
+        break;
+      }
     }
   }
 
@@ -199,6 +351,16 @@ function parseEventDetails(text) {
     }
   }
 
+  // Post-process event name to fix common OCR errors
+  if (details.eventName) {
+    // Fix common OCR mistakes
+    details.eventName = details.eventName
+      .replace(/\bIc\b/gi, 'Re') // Fix "Ic" -> "Re"
+      .replace(/\b0\b/g, 'O') // Fix "0" -> "O" in words
+      .replace(/\b1\b/g, 'I') // Fix "1" -> "I" in words
+      .trim();
+  }
+
   // Only return fields that have valid content (confidence threshold)
   const result = {};
   Object.keys(details).forEach(key => {
@@ -218,6 +380,15 @@ export async function extractEventDetails(file) {
 
   try {
     if (file.type.startsWith('image/')) {
+      // For images, try AI extraction first
+      if (OPENAI_API_KEY) {
+        const aiResult = await extractEventDetailsWithOpenAI(file);
+        if (aiResult && Object.keys(aiResult).length > 0) {
+          return aiResult; // Return directly if AI extraction successful
+        }
+      }
+      
+      // Fallback to OCR + parsing
       extractedText = await extractTextFromImage(file);
     } else if (file.type === 'application/pdf') {
       extractedText = await extractTextFromPDF(file);
